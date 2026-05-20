@@ -1,0 +1,12 @@
+# Rust
+target/
+native-host/target/
+Cargo.lock
+
+# General
+*.log
+.env
+.DS_Store
+
+# Native host binary
+/usr/local/bin/topos-host

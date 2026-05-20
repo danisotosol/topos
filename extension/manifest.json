@@ -1,0 +1,60 @@
+{
+  "manifest_version": 3,
+  "name": "Topos Cast",
+  "version": "0.1.0",
+  "description": "Stream video from any web page to your TV or Chromecast",
+
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "topos@cast",
+      "strict_min_version": "109.0"
+    }
+  },
+
+  "permissions": [
+    "nativeMessaging",
+    "storage",
+    "webRequest",
+    "tabs",
+    "activeTab",
+    "scripting"
+  ],
+
+  "host_permissions": ["<all_urls>"],
+
+  "background": {
+    "scripts": ["src/background.js"],
+    "type": "module"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/content.js"],
+      "all_frames": true,
+      "run_at": "document_start"
+    }
+  ],
+
+  "action": {
+    "default_popup": "src/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+
+  "web_accessible_resources": [
+    {
+      "resources": ["src/injected.js"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
