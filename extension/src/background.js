@@ -83,4 +83,19 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
       title: message.title,
     });
   }
+
+  if (message.type === "STREAM_DETECTED") {
+    if (!sender.tab) return;
+
+    const tabId = sender.tab?.id;
+
+    if (!streams[tabId]) {
+      streams[tabId] = [];
+    }
+
+    if (!streams[tabId].includes(message.url)) {
+      streams[tabId].push(message.url);
+      console.log("[Topos] Stream via injected:", message.url);
+    }
+  }
 });
