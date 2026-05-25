@@ -5,8 +5,7 @@
   function notifyIfStream(url, method) {
     if (
       url.includes(".m3u8") ||
-      url.includes(".mpd") ||
-      url.includes("playlist")
+      url.includes(".mpd")
     ) {
       window.postMessage(
         { source: "TOPOS_INJECTED", type: "STREAM_DETECTED", method, url },
