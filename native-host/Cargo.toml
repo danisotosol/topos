@@ -8,6 +8,7 @@ name = "topos-host"
 path = "src/main.rs"
 
 [dependencies]
+openssl     = "0.10"
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 tokio       = { version = "1", features = ["full"] }

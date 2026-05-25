@@ -3,6 +3,84 @@ const api = globalThis.browser ?? globalThis.chrome;
 // Streams detected in the current tab
 let currentStreams = [];
 let currentTabUrl = "";
+let isPaused = false;
+let knownTime = 0;       // last confirmed position from Chromecast (seconds)
+let knownAt = 0;         // Date.now() when knownTime was set
+let totalDuration = 0;   // total media duration (seconds), 0 = unknown
+let seekInterval = null;
+let isSeeking = false;   // true while user is dragging the slider
+
+function formatTime(secs) {
+  const s = Math.max(0, Math.floor(secs));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = s % 60;
+  const mm = String(m).padStart(2, "0");
+  const zz = String(ss).padStart(2, "0");
+  return h > 0 ? `${h}:${mm}:${zz}` : `${mm}:${zz}`;
+}
+
+function setSliderProgress(slider, value, max) {
+  // Paint the filled portion of the track using a gradient
+  const pct = max > 0 ? (value / max) * 100 : 0;
+  slider.style.background = `linear-gradient(to right, var(--accent) ${pct}%, var(--border-strong) ${pct}%)`;
+}
+
+function syncSlider(currentTime) {
+  const slider = document.getElementById("seek-bar");
+  const timeEl = document.getElementById("ctrl-time");
+  slider.value = currentTime;
+  setSliderProgress(slider, currentTime, totalDuration);
+  const durStr = totalDuration > 0 ? ` / ${formatTime(totalDuration)}` : "";
+  timeEl.textContent = formatTime(currentTime) + durStr;
+}
+
+function startTimeTracking() {
+  if (seekInterval) clearInterval(seekInterval);
+  seekInterval = setInterval(() => {
+    if (!isSeeking) {
+      // Estimate current position locally — no reconnection needed
+      const estimated = isPaused ? knownTime : knownTime + (Date.now() - knownAt) / 1000;
+      syncSlider(Math.min(estimated, totalDuration || Infinity));
+    }
+  }, 1000);
+}
+
+function stopTimeTracking() {
+  if (seekInterval) clearInterval(seekInterval);
+  seekInterval = null;
+}
+
+function showControls(deviceName) {
+  document.getElementById("controls-label").textContent = `Now casting · ${deviceName}`;
+  document.getElementById("controls").style.display = "";
+  startTimeTracking();
+}
+
+function hideControls() {
+  document.getElementById("controls").style.display = "none";
+  stopTimeTracking();
+  isPaused = false;
+  knownTime = 0;
+  totalDuration = 0;
+}
+
+function updateCastState(playerState, currentTime, duration) {
+  isPaused = playerState === "PAUSED";
+  const btn = document.getElementById("btn-pause-play");
+  btn.textContent = isPaused ? "▶ Play" : "⏸ Pause";
+  btn.className = isPaused ? "btn-ctrl" : "btn-ctrl primary";
+
+  knownTime = currentTime;
+  knownAt = Date.now();
+
+  if (duration != null && duration > 0) {
+    totalDuration = duration;
+    document.getElementById("seek-bar").max = duration;
+  }
+
+  syncSlider(currentTime);
+}
 
 async function init() {
   // grab the first element of tab
@@ -31,8 +109,43 @@ async function init() {
       badge.className = "live-badge";
       badge.textContent = "live";
       btn.appendChild(badge);
+      const name = btn.querySelector(".device-name")?.textContent ?? "device";
+      showControls(name);
+      // Ask native host for current position (reconnects once to query state)
+      api.runtime.sendMessage({ type: "QUERY_CAST_STATE" });
     }
   }
+
+  // Playback controls
+  document.getElementById("btn-pause-play").addEventListener("click", () => {
+    api.runtime.sendMessage({ type: isPaused ? "PLAY_CAST" : "PAUSE_CAST" });
+  });
+
+  document.getElementById("btn-skip-back").addEventListener("click", () => {
+    const pos = isPaused ? knownTime : knownTime + (Date.now() - knownAt) / 1000;
+    api.runtime.sendMessage({ type: "SEEK_CAST", position: Math.max(0, pos - 10) });
+  });
+
+  document.getElementById("btn-skip-fwd").addEventListener("click", () => {
+    const pos = isPaused ? knownTime : knownTime + (Date.now() - knownAt) / 1000;
+    api.runtime.sendMessage({ type: "SEEK_CAST", position: pos + 10 });
+  });
+
+  const slider = document.getElementById("seek-bar");
+
+  // While dragging: update display only (no network call)
+  slider.addEventListener("input", () => {
+    isSeeking = true;
+    const val = parseFloat(slider.value);
+    syncSlider(val);
+  });
+
+  // On release: send the seek command
+  slider.addEventListener("change", () => {
+    isSeeking = false;
+    const val = parseFloat(slider.value);
+    api.runtime.sendMessage({ type: "SEEK_CAST", position: val });
+  });
 }
 
 function renderStreams(urls) {
@@ -123,6 +236,7 @@ function renderDevices(devices) {
         badge.className = "live-badge";
         badge.textContent = "live";
         btn.appendChild(badge);
+        showControls(device.name);
 
         const url = currentStreams[0];
         api.runtime.sendMessage({
@@ -133,8 +247,10 @@ function renderDevices(devices) {
           device_port: device.port,
           title: device.name,
           referer: currentTabUrl,
+          tab_id: currentTabId,
         });
       } else {
+        hideControls();
         api.runtime.sendMessage({ type: "STOP_CAST" });
       }
     });
@@ -148,6 +264,9 @@ let currentTabId = null;
 api.runtime.onMessage.addListener((message) => {
   if (message.type === "STREAMS_UPDATED" && message.tabId === currentTabId) {
     renderStreams(message.streams);
+  }
+  if (message.type === "CAST_STATE") {
+    updateCastState(message.player_state, message.current_time, message.duration);
   }
 });
 

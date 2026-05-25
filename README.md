@@ -18,21 +18,33 @@ Detects HLS (`.m3u8`) and DASH (`.mpd`) streams by intercepting network requests
 
 ---
 
+## Features
+
+- **Auto-detect streams** — intercepts `.m3u8` / `.mpd` requests and `fetch`/`XHR` calls from any page
+- **Local proxy** — re-routes the stream through your machine so auth tokens stay valid on the Chromecast
+- **Subtitles** — detects external VTT subtitle files and sends them as active text tracks
+- **Playback controls** — pause, play, seek from the popup without leaving the browser
+- **Cast state persists** — closing and reopening the popup keeps the casting indicator and controls
+- **mDNS discovery** — finds all Chromecast / Google TV devices on the local network automatically
+
+---
+
 ## How it works
 
 ```
 Browser (JS extension)
-  │  intercepts .m3u8 / .mpd requests
+  │  intercepts .m3u8 / .mpd requests + fetch/XHR patches
   │  Native Messaging Protocol (stdin/stdout)
   ▼
 topos-host (Rust binary)
+  │  HTTP proxy on port 7070 — rewrites HLS manifests, forwards auth headers
   │  mDNS — discovers Chromecasts on local network
   │  Google Cast protocol (TLS + protobuf, port 8009)
   ▼
 Chromecast / Google TV
 ```
 
-The browser extension is minimal JavaScript glue (~100 lines). All real logic lives in the native host binary written in Rust that's ultra lightweight.
+The browser extension is minimal JavaScript glue. All real logic — proxy, Cast protocol, mDNS discovery — lives in the native host written in Rust.
 
 ---
 
@@ -50,7 +62,14 @@ The browser extension is minimal JavaScript glue (~100 lines). All real logic li
 ```bash
 git clone https://github.com/danisotosol/topos
 cd topos
+bash install.sh
+```
 
+`install.sh` compiles the binary, installs it, registers the native host manifests for Firefox and Chrome/Chromium, and opens port 7070 through UFW if the firewall is active.
+
+**Manual steps if you prefer:**
+
+```bash
 # Build and install the native host
 cd native-host
 cargo build --release
@@ -60,6 +79,9 @@ cd ..
 # Register the native host for Firefox
 mkdir -p ~/.mozilla/native-messaging-hosts
 cp native-host/com.topos.cast.firefox.json ~/.mozilla/native-messaging-hosts/com.topos.cast.json
+
+# Open the proxy port if UFW is active
+sudo ufw allow from 192.168.1.0/24 to any port 7070
 ```
 
 Then load the extension:
@@ -72,10 +94,23 @@ Then load the extension:
 
 ## Usage
 
-1. Open any page with a video (Twitch, a news site, any HLS/DASH stream)
+1. Open any page with a video
 2. Click the Topos icon in the toolbar
-3. Click **Scan** to find devices on your network
-4. Select a stream → select a device → **Cast**
+3. Click **Rescan** to find devices on your network
+4. A stream is detected automatically — click a device to cast
+5. Use the **pause / play / seek** controls in the popup while casting
+
+---
+
+## Firewall note
+
+The Chromecast fetches the stream from your machine on port `7070`. If you run UFW or another firewall, you must allow it:
+
+```bash
+sudo ufw allow from 192.168.1.0/24 to any port 7070
+```
+
+Replace `192.168.1.0/24` with your actual LAN subnet if different.
 
 ---
 

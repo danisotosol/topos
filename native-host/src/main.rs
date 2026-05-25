@@ -26,9 +26,19 @@ enum IncomingMessage {
         cookies: String,
         #[serde(default)]
         referer: String,
+        #[serde(default)]
+        subtitle_url: String,
     },
     #[serde(rename = "STOP_CAST")]
     StopCast,
+    #[serde(rename = "PAUSE_CAST")]
+    PauseCast,
+    #[serde(rename = "PLAY_CAST")]
+    PlayCast,
+    #[serde(rename = "SEEK_CAST")]
+    SeekCast { position: f64 },
+    #[serde(rename = "QUERY_CAST_STATE")]
+    QueryCastState,
 }
 
 #[derive(Serialize)]
@@ -40,6 +50,8 @@ enum OutgoingMessage {
     CastStarted { device: String, proxy_url: String },
     #[serde(rename = "CAST_ERROR")]
     CastError { error: String },
+    #[serde(rename = "CAST_STATE")]
+    CastState { player_state: String, current_time: f64, duration: Option<f64> },
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -95,6 +107,28 @@ fn get_local_ip() -> String {
 
 // ── HLS manifest rewriting ────────────────────────────────────────────────────
 
+// Forces DEFAULT=YES and AUTOSELECT=YES on an #EXT-X-MEDIA:TYPE=SUBTITLES line so that
+// Shaka Player (DefaultMediaReceiver) activates the track without user interaction.
+fn force_subtitle_autoselect(line: &str) -> String {
+    let set = |s: &str, attr: &str, val: &str| -> String {
+        let upper = attr.to_uppercase();
+        if let Some(pos) = s.to_uppercase().find(&format!("{}=", upper)) {
+            // Replace existing value
+            let after = &s[pos + attr.len() + 1..];
+            let end = after.find(',').unwrap_or(after.len());
+            format!("{}{}", &s[..pos + attr.len() + 1], format!("{}{}", val, &after[end..]))
+        } else {
+            // Inject before the first comma or at end
+            match s.find(',') {
+                Some(p) => format!("{},{}={}{}", &s[..p], attr, val, &s[p..]),
+                None => format!("{},{}={}", s, attr, val),
+            }
+        }
+    };
+    let line = set(line, "DEFAULT", "YES");
+    set(&line, "AUTOSELECT", "YES")
+}
+
 // Rewrites every segment/playlist URI in an m3u8 body to route through the local proxy.
 // Resolves relative URIs against base_url before encoding, so the proxy receives absolute URLs.
 // Also rewrites URI="..." attributes inside tags like #EXT-X-MAP and #EXT-X-KEY.
@@ -121,8 +155,13 @@ fn rewrite_m3u8(body: &str, base_url: &str, proxy_base: &str) -> String {
             }
 
             if line.starts_with('#') {
-                // Rewrite URI="..." inside tags: #EXT-X-MAP, #EXT-X-KEY, #EXT-X-MEDIA, etc.
-                rewrite_tag_uris(line, &resolve)
+                let rewritten = rewrite_tag_uris(line, &resolve);
+                // Force subtitle tracks to auto-select so DefaultMediaReceiver enables them
+                if rewritten.contains("TYPE=SUBTITLES") {
+                    force_subtitle_autoselect(&rewritten)
+                } else {
+                    rewritten
+                }
             } else {
                 resolve(line)
             }
@@ -358,6 +397,165 @@ fn scan_cast_devices() -> Vec<Device> {
     devices
 }
 
+// ── Raw Cast protocol (for LOAD with subtitle tracks) ─────────────────────
+//
+// rust-cast 0.14 does not support the `tracks`/`activeTrackIds` fields in
+// the Cast LOAD command. External VTT subtitles cannot be added via
+// EDIT_TRACKS_INFO after the fact — they must be declared at load time.
+// We implement a minimal raw sender: manual protobuf + openssl TLS, reusing
+// the device connection already established by rust-cast for connect/launch.
+
+fn varint_encode(mut v: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let mut b = (v & 0x7F) as u8;
+        v >>= 7;
+        if v != 0 { b |= 0x80; }
+        out.push(b);
+        if v == 0 { break; }
+    }
+    out
+}
+
+fn pb_string(field: u32, s: &str) -> Vec<u8> {
+    let tag = (field << 3) | 2; // wire type 2 = length-delimited
+    let mut out = varint_encode(tag as u64);
+    out.extend(varint_encode(s.len() as u64));
+    out.extend_from_slice(s.as_bytes());
+    out
+}
+
+fn pb_int32(field: u32, v: i32) -> Vec<u8> {
+    let tag = field << 3; // wire type 0 = varint
+    let mut out = varint_encode(tag as u64);
+    out.extend(varint_encode(v as u64));
+    out
+}
+
+// Serialises a CastMessage protobuf manually (avoids pulling in prost/protobuf).
+// CastMessage fields: 1=protocol_version, 2=source_id, 3=destination_id,
+//                     4=namespace, 5=payload_type, 6=payload_utf8
+fn build_cast_message(source: &str, dest: &str, ns: &str, payload: &str) -> Vec<u8> {
+    let mut msg = Vec::new();
+    msg.extend(pb_int32(1, 0));         // CASTV2_1_0
+    msg.extend(pb_string(2, source));
+    msg.extend(pb_string(3, dest));
+    msg.extend(pb_string(4, ns));
+    msg.extend(pb_int32(5, 0));         // STRING payload
+    msg.extend(pb_string(6, payload));
+    msg
+}
+
+fn write_cast_frame(stream: &mut impl std::io::Write, bytes: &[u8]) -> Result<(), std::io::Error> {
+    use byteorder::{BigEndian, WriteBytesExt};
+    stream.write_u32::<BigEndian>(bytes.len() as u32)?;
+    stream.write_all(bytes)?;
+    Ok(())
+}
+
+fn cast_connect_msg(source: &str, dest: &str) -> Vec<u8> {
+    build_cast_message(
+        source, dest,
+        "urn:x-cast:com.google.cast.tp.connection",
+        r#"{"type":"CONNECT","userAgent":"Topos/1.0"}"#,
+    )
+}
+
+// Detect subtitle language code from URL filename (e.g. "spa-42.vtt" → "es")
+fn subtitle_language(url: &str) -> &str {
+    let filename = url.rsplit('/').next().unwrap_or("");
+    let stem = filename.split('.').next().unwrap_or("");
+    let code = stem.split('-').next().unwrap_or("und");
+    match code {
+        "spa" => "es",
+        "eng" => "en",
+        "por" | "pt-BR" | "pt-PT" => "pt",
+        "fra" => "fr",
+        "deu" | "ger" => "de",
+        "ita" => "it",
+        "jpn" => "ja",
+        "kor" => "ko",
+        "zho" | "chi" | "zh" => "zh",
+        other => other,
+    }
+}
+
+// Opens a fresh TLS connection to the Chromecast and sends a LOAD command that
+// includes the subtitle VTT as an external text track with activeTrackIds=[1].
+// Called after rust-cast has launched DefaultMediaReceiver and its connection drops.
+fn raw_cast_load(
+    ip: &str,
+    port: u16,
+    transport_id: &str,
+    session_id: &str,
+    content_id: &str,
+    content_type: &str,
+    subtitle_proxy_url: &str,
+    subtitle_lang: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+    use std::net::TcpStream;
+
+    let mut builder = SslConnector::builder(SslMethod::tls())?;
+    builder.set_verify(SslVerifyMode::NONE);
+    let connector = builder.build();
+    let tcp = TcpStream::connect((ip, port))?;
+    let mut stream = connector.connect(ip, tcp)?;
+
+    // Virtual channel CONNECT to receiver-0
+    let conn_r0 = cast_connect_msg("sender-0", "receiver-0");
+    write_cast_frame(&mut stream, &conn_r0)?;
+
+    // Virtual channel CONNECT to the app transport
+    let conn_tp = cast_connect_msg("sender-0", transport_id);
+    write_cast_frame(&mut stream, &conn_tp)?;
+
+    // LOAD with tracks + activeTrackIds
+    let load_json = serde_json::json!({
+        "type": "LOAD",
+        "requestId": 1,
+        "sessionId": session_id,
+        "autoplay": true,
+        "media": {
+            "contentId": content_id,
+            "contentType": content_type,
+            "streamType": "BUFFERED",
+            "tracks": [{
+                "trackId": 1,
+                "type": "TEXT",
+                "trackContentId": subtitle_proxy_url,
+                "trackContentType": "text/vtt",
+                "subtype": "SUBTITLES",
+                "language": subtitle_lang,
+                "name": subtitle_lang
+            }]
+        },
+        "activeTrackIds": [1],
+        "textTrackStyle": {
+            "backgroundColor": "#00000000",
+            "edgeColor": "#000000FF",
+            "edgeType": "OUTLINE",
+            "fontFamily": "SANS_SERIF",
+            "fontScale": 1.0,
+            "foregroundColor": "#FFFFFFFF",
+            "windowType": "NONE"
+        }
+    })
+    .to_string();
+
+    let load_msg = build_cast_message(
+        "sender-0",
+        transport_id,
+        "urn:x-cast:com.google.cast.media",
+        &load_json,
+    );
+    write_cast_frame(&mut stream, &load_msg)?;
+    stream.flush()?;
+
+    eprintln!("[topos] raw LOAD with subtitle track sent (lang={})", subtitle_lang);
+    Ok(())
+}
+
 // ── Cast ──────────────────────────────────────────────────────────────────────
 
 struct CastSession {
@@ -365,7 +563,7 @@ struct CastSession {
     session_id: String,
 }
 
-fn cast_stream(device: &Device, url: &str, proxy_base: &str) -> Option<CastSession> {
+fn cast_stream(device: &Device, url: &str, proxy_base: &str, subtitle_url: &str) -> Option<CastSession> {
     use rust_cast::channels::media::{Media, StreamType};
     use rust_cast::channels::receiver::CastDeviceApp;
     use rust_cast::CastDevice;
@@ -378,16 +576,23 @@ fn cast_stream(device: &Device, url: &str, proxy_base: &str) -> Option<CastSessi
         "video/mp4"
     };
 
-    let stream_type = StreamType::Buffered;
-
     // Route through local proxy: Chromecast fetches via this machine's IP,
     // which is the same IP that got the auth token from the streaming site.
     let proxy_url = format!("{}/proxy?url={}", proxy_base, urlencoding::encode(url));
+    let subtitle_proxy_url = if subtitle_url.is_empty() {
+        String::new()
+    } else {
+        format!("{}/proxy?url={}", proxy_base, urlencoding::encode(subtitle_url))
+    };
 
     eprintln!("[topos] connecting to {}:{}", device.ip, device.port);
     eprintln!("[topos] cast url (proxied): {}", &proxy_url[..proxy_url.len().min(100)]);
 
-    let result = (|| -> Result<String, Box<dyn std::error::Error>> {
+    let has_subtitle = !subtitle_url.is_empty();
+
+    // When subtitles are present we skip rust-cast's load() and send our own
+    // raw LOAD that includes the tracks field (unsupported by rust-cast 0.14).
+    let result = (|| -> Result<(String, String), Box<dyn std::error::Error>> {
         let cast =
             CastDevice::connect_without_host_verification(device.ip.as_str(), device.port)?;
 
@@ -399,27 +604,47 @@ fn cast_stream(device: &Device, url: &str, proxy_base: &str) -> Option<CastSessi
 
         cast.connection.connect(app.transport_id.as_str())?;
 
-        cast.media.load(
-            app.transport_id.as_str(),
-            app.session_id.as_str(),
-            &Media {
-                content_id: proxy_url,
-                content_type: content_type.to_string(),
-                stream_type,
-                duration: None,
-                metadata: None,
-            },
-        )?;
+        if !has_subtitle {
+            cast.media.load(
+                app.transport_id.as_str(),
+                app.session_id.as_str(),
+                &Media {
+                    content_id: proxy_url.clone(),
+                    content_type: content_type.to_string(),
+                    stream_type: StreamType::Buffered,
+                    duration: None,
+                    metadata: None,
+                },
+            )?;
+        }
+        // If has_subtitle: let cast drop here, then send raw LOAD below
 
-        Ok(app.session_id)
+        Ok((app.session_id, app.transport_id))
     })();
 
     match result {
-        Ok(session_id) => {
-            let proxy_url = format!("{}/proxy?url={}", proxy_base, urlencoding::encode(url));
+        Ok((session_id, transport_id)) => {
+            if has_subtitle {
+                let lang = subtitle_language(subtitle_url);
+                if let Err(e) = raw_cast_load(
+                    &device.ip,
+                    device.port,
+                    &transport_id,
+                    &session_id,
+                    &proxy_url,
+                    content_type,
+                    &subtitle_proxy_url,
+                    lang,
+                ) {
+                    eprintln!("[topos] raw LOAD error: {e}");
+                    send(&OutgoingMessage::CastError { error: e.to_string() });
+                    return None;
+                }
+            }
+
             send(&OutgoingMessage::CastStarted {
                 device: device.name.clone(),
-                proxy_url,
+                proxy_url: proxy_url.clone(),
             });
             Some(CastSession {
                 device: device.clone(),
@@ -453,6 +678,63 @@ fn stop_cast(session: &CastSession) {
     }
 }
 
+// ── Playback control ──────────────────────────────────────────────────────
+
+// Reconnects to the Chromecast, finds the active media session, runs `action`,
+// then queries the updated player state to return to the extension.
+// Uses launch_app (idempotent — returns existing session without restarting it).
+fn reconnect_media<F>(session: &CastSession, action: F)
+where
+    F: FnOnce(&rust_cast::CastDevice, &str, i32) -> Result<(), Box<dyn std::error::Error>>,
+{
+    use rust_cast::channels::media::PlayerState;
+    use rust_cast::channels::receiver::CastDeviceApp;
+    use rust_cast::CastDevice;
+
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let cast =
+            CastDevice::connect_without_host_verification(session.device.ip.as_str(), session.device.port)?;
+        cast.connection.connect("receiver-0")?;
+
+        let app = cast.receiver.launch_app(&CastDeviceApp::DefaultMediaReceiver)?;
+        cast.connection.connect(app.transport_id.as_str())?;
+
+        let response = cast.media.get_status(app.transport_id.as_str(), None)?;
+        let status = response.entries.first().ok_or("no active media session")?;
+        let media_session_id = status.media_session_id;
+
+        action(&cast, app.transport_id.as_str(), media_session_id)?;
+
+        // Query updated state and report it to the extension
+        let updated = cast.media.get_status(app.transport_id.as_str(), None)?;
+        let s = updated.entries.first();
+        let player_state = s
+            .map(|s| match s.player_state {
+                PlayerState::Playing => "PLAYING",
+                PlayerState::Paused => "PAUSED",
+                PlayerState::Buffering => "BUFFERING",
+                PlayerState::Idle => "IDLE",
+            })
+            .unwrap_or("UNKNOWN");
+        let current_time = s.and_then(|s| s.current_time).unwrap_or(0.0) as f64;
+        let duration = s
+            .and_then(|s| s.media.as_ref())
+            .and_then(|m| m.duration)
+            .map(|d| d as f64);
+
+        send(&OutgoingMessage::CastState {
+            player_state: player_state.to_string(),
+            current_time,
+            duration,
+        });
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        eprintln!("[topos] media control error: {e}");
+    }
+}
+
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
 fn main_loop(proxy_base: String, cookies_store: Arc<RwLock<String>>, referer_store: Arc<RwLock<String>>) {
@@ -479,6 +761,7 @@ fn main_loop(proxy_base: String, cookies_store: Arc<RwLock<String>>, referer_sto
                     title,
                     cookies,
                     referer,
+                    subtitle_url,
                 }) => {
                     if !cookies.is_empty() {
                         eprintln!("[topos] got {} cookie bytes from browser", cookies.len());
@@ -492,18 +775,53 @@ fn main_loop(proxy_base: String, cookies_store: Arc<RwLock<String>>, referer_sto
                             *guard = referer;
                         }
                     }
+                    if !subtitle_url.is_empty() {
+                        eprintln!("[topos] subtitle URL from browser: {}", &subtitle_url[..subtitle_url.len().min(100)]);
+                    } else {
+                        eprintln!("[topos] no subtitle URL detected (subtitles may be embedded in HLS manifest)");
+                    }
                     let device = Device {
                         id: device_id,
                         name: title,
                         ip: device_ip,
                         port: device_port,
                     };
-                    active_session = cast_stream(&device, &url, &proxy_base);
+                    active_session = cast_stream(&device, &url, &proxy_base, &subtitle_url);
                 }
                 Ok(IncomingMessage::StopCast) => {
                     if let Some(ref session) = active_session {
                         stop_cast(session);
                         active_session = None;
+                    }
+                }
+                Ok(IncomingMessage::PauseCast) => {
+                    if let Some(ref session) = active_session {
+                        reconnect_media(session, |cast, dest, media_id| {
+                            cast.media.pause(dest, media_id)?;
+                            Ok(())
+                        });
+                    }
+                }
+                Ok(IncomingMessage::PlayCast) => {
+                    if let Some(ref session) = active_session {
+                        reconnect_media(session, |cast, dest, media_id| {
+                            cast.media.play(dest, media_id)?;
+                            Ok(())
+                        });
+                    }
+                }
+                Ok(IncomingMessage::SeekCast { position }) => {
+                    if let Some(ref session) = active_session {
+                        reconnect_media(session, |cast, dest, media_id| {
+                            use rust_cast::channels::media::ResumeState;
+                            cast.media.seek(dest, media_id, Some(position as f32), Some(ResumeState::PlaybackStart))?;
+                            Ok(())
+                        });
+                    }
+                }
+                Ok(IncomingMessage::QueryCastState) => {
+                    if let Some(ref session) = active_session {
+                        reconnect_media(session, |_cast, _dest, _media_id| Ok(()));
                     }
                 }
             },
