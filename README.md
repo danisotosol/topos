@@ -32,7 +32,7 @@ topos-host (Rust binary)
 Chromecast / Google TV
 ```
 
-The browser extension is minimal JavaScript glue (~100 lines). All real logic lives in the native host binary written in Rust.
+The browser extension is minimal JavaScript glue (~100 lines). All real logic lives in the native host binary written in Rust that's ultra lightweight.
 
 ---
 
