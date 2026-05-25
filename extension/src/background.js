@@ -31,6 +31,9 @@ function connectNativeHost() {
       console.log("[Topos] Proxy URL (open in Firefox to test):", message.proxy_url);
     } else if (message.type === "CAST_ERROR") {
       console.error("[Topos] Cast error:", message.error);
+    } else if (message.type === "CAST_STATE") {
+      // Relay playback state updates to the popup (if open)
+      api.runtime.sendMessage(message).catch(() => {});
     }
   });
 
@@ -39,13 +42,26 @@ function connectNativeHost() {
   });
 }
 
-// Listens for web requests to detect media streams
+// Per-tab subtitle URLs (first VTT/SRT detected wins)
+const subtitles = {};
+
+// Listens for web requests to detect media streams and subtitle files
 api.webRequest.onBeforeRequest.addListener(
   (details) => {
     const url = details.url;
     const tabId = details.tabId;
 
     if (tabId < 0) return;
+
+    // Detect subtitle files — store the first one found per tab
+    const isSubtitle = url.includes(".vtt") || url.includes(".srt") || url.includes(".ass");
+    if (isSubtitle) {
+      if (!subtitles[tabId]) {
+        subtitles[tabId] = url;
+        console.log("[Topos] Subtitle detected:", url);
+      }
+      return;
+    }
 
     if (!streams[tabId]) {
       streams[tabId] = [];
@@ -71,6 +87,7 @@ api.webRequest.onBeforeRequest.addListener(
 api.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === "loading" && changeInfo.url) {
     delete streams[tabId];
+    delete subtitles[tabId];
     api.storage.session.remove(`streams_${tabId}`);
   }
 });
@@ -108,6 +125,9 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       const referer = message.referer ?? "";
       console.log("[Topos] Referer for proxy:", referer || "(none)");
+      const subtitleUrl = subtitles[message.tab_id] ?? "";
+      if (subtitleUrl) console.log("[Topos] Subtitle URL for cast:", subtitleUrl);
+      else console.log("[Topos] No subtitle URL detected for tab", message.tab_id);
       nativePort.postMessage({
         type: "CAST_STREAM",
         url: message.url,
@@ -117,6 +137,7 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
         title: message.title,
         cookies: cookieHeader,
         referer,
+        subtitle_url: subtitleUrl,
       });
     })();
     return; // fire-and-forget, no sendResponse needed
@@ -125,6 +146,14 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "STOP_CAST") {
     castingDeviceId = null;
     if (nativePort) nativePort.postMessage({ type: "STOP_CAST" });
+  }
+
+  if (message.type === "PAUSE_CAST" || message.type === "PLAY_CAST" || message.type === "QUERY_CAST_STATE") {
+    if (nativePort) nativePort.postMessage({ type: message.type });
+  }
+
+  if (message.type === "SEEK_CAST") {
+    if (nativePort) nativePort.postMessage({ type: "SEEK_CAST", position: message.position });
   }
 
   if (message.type === "GET_CAST_STATE") {

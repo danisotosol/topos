@@ -250,6 +250,77 @@
     .status-dot.warn  { background: var(--warn); box-shadow: 0 0 6px rgba(244,184,60,0.40); }
 
     .version { color: var(--text-faint); font-family: var(--font-mono); font-size: 10.5px; }
+
+    .controls {
+      padding: 12px 16px 14px;
+      border-top: 1px solid var(--border);
+      background: rgba(216,127,142,0.04);
+    }
+    .controls-label {
+      font-size: 10.5px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 1.1px;
+      color: var(--accent-dim);
+      margin-bottom: 10px;
+    }
+    .ctrl-row { display: flex; gap: 7px; }
+    .btn-ctrl {
+      flex: 1;
+      padding: 7px 6px;
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      border-radius: var(--r-md);
+      color: var(--text-dim);
+      font-family: inherit;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background .12s, border-color .12s, color .12s;
+    }
+    .btn-ctrl:hover { background: var(--surface-hover); border-color: var(--border-strong); color: var(--text); }
+    .btn-ctrl.primary {
+      background: rgba(216,127,142,0.13);
+      border-color: rgba(216,127,142,0.35);
+      color: var(--accent);
+    }
+    .btn-ctrl.primary:hover { background: rgba(216,127,142,0.22); }
+    .seek-bar {
+      display: block;
+      width: 100%;
+      margin-top: 10px;
+      -webkit-appearance: none;
+      appearance: none;
+      height: 4px;
+      border-radius: 999px;
+      background: var(--border-strong);
+      outline: none;
+      cursor: pointer;
+    }
+    .seek-bar::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 14px; height: 14px;
+      border-radius: 999px;
+      background: var(--accent);
+      cursor: pointer;
+      box-shadow: 0 0 6px rgba(216,127,142,0.5);
+    }
+    .seek-bar::-moz-range-thumb {
+      width: 14px; height: 14px;
+      border-radius: 999px;
+      background: var(--accent);
+      border: none;
+      cursor: pointer;
+      box-shadow: 0 0 6px rgba(216,127,142,0.5);
+    }
+    .ctrl-time {
+      margin-top: 8px;
+      font-size: 11px;
+      color: var(--text-faint);
+      font-family: var(--font-mono);
+      text-align: center;
+    }
   </style>
 </head>
 <body>
@@ -280,6 +351,17 @@
       <span class="count" id="device-count">0</span>
     </div>
     <div class="list" id="device-list"></div>
+  </section>
+
+  <section class="controls" id="controls" style="display:none">
+    <div class="controls-label" id="controls-label">Now casting</div>
+    <div class="ctrl-row">
+      <button class="btn-ctrl" id="btn-skip-back">−10s</button>
+      <button class="btn-ctrl primary" id="btn-pause-play">⏸ Pause</button>
+      <button class="btn-ctrl" id="btn-skip-fwd">+10s</button>
+    </div>
+    <input class="seek-bar" id="seek-bar" type="range" min="0" max="0" value="0" step="1" />
+    <div class="ctrl-time" id="ctrl-time">--:--</div>
   </section>
 
   <footer class="footer">
