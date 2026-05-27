@@ -208,7 +208,11 @@ struct ProxyState {
 // Responds to CORS preflight (OPTIONS) from the Chromecast's Chrome browser.
 // Chrome's Private Network Access policy requires Access-Control-Allow-Private-Network: true
 // before it will allow a public HTTPS origin (gstatic.com) to fetch from a private IP.
-async fn options_handler() -> axum::response::Response {
+async fn options_handler(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let url = params.get("url").map(|u| &u[..u.len().min(80)]).unwrap_or("(no url)");
+    eprintln!("[topos proxy] OPTIONS preflight for: {}", url);
     axum::response::Response::builder()
         .status(204)
         .header("access-control-allow-origin", "*")
@@ -236,6 +240,11 @@ async fn proxy_handler(
 
     let cookies = state.cookies.read().map(|g| g.clone()).unwrap_or_default();
     let referer = state.referer.read().map(|g| g.clone()).unwrap_or_default();
+    // Derive Origin from Referer — some CDNs require it for CORS
+    let origin = url::Url::parse(&referer)
+        .ok()
+        .map(|u| format!("{}://{}", u.scheme(), u.host_str().unwrap_or("")))
+        .unwrap_or_default();
 
     let mut req = state.client.get(&url);
     if !cookies.is_empty() {
@@ -243,6 +252,9 @@ async fn proxy_handler(
     }
     if !referer.is_empty() {
         req = req.header("Referer", &referer);
+    }
+    if !origin.is_empty() {
+        req = req.header("Origin", &origin);
     }
 
     let upstream = match req.send().await {
@@ -254,6 +266,14 @@ async fn proxy_handler(
     };
 
     let status = upstream.status();
+    // Log every upstream response so we can spot 403/404 for segments
+    eprintln!("[topos proxy] {} → {}", &url[..url.len().min(80)], status);
+
+    // Use the final URL after any redirects as the rewriting base.
+    // If reqwest followed a redirect, relative URIs in the m3u8 must be
+    // resolved against the redirect target, not the original URL.
+    let final_url = upstream.url().to_string();
+
     let content_type = upstream
         .headers()
         .get("content-type")
@@ -267,7 +287,7 @@ async fn proxy_handler(
     if is_m3u8 {
         match upstream.text().await {
             Ok(body) => {
-                let rewritten = rewrite_m3u8(&body, &url, &state.proxy_base);
+                let rewritten = rewrite_m3u8(&body, &final_url, &state.proxy_base);
                 axum::response::Response::builder()
                     .status(status)
                     .header("content-type", "application/x-mpegURL")
@@ -590,8 +610,10 @@ fn cast_stream(device: &Device, url: &str, proxy_base: &str, subtitle_url: &str)
 
     let has_subtitle = !subtitle_url.is_empty();
 
-    // When subtitles are present we skip rust-cast's load() and send our own
-    // raw LOAD that includes the tracks field (unsupported by rust-cast 0.14).
+    // When subtitles are present we send a raw LOAD (rust-cast 0.14 lacks tracks support).
+    // Critical: raw_cast_load must be called INSIDE the closure, while the rust-cast
+    // CastDevice is still alive — if it drops first, the Chromecast may kill the app
+    // and the LOAD goes to a dead transport_id.
     let result = (|| -> Result<(String, String), Box<dyn std::error::Error>> {
         let cast =
             CastDevice::connect_without_host_verification(device.ip.as_str(), device.port)?;
@@ -604,7 +626,19 @@ fn cast_stream(device: &Device, url: &str, proxy_base: &str, subtitle_url: &str)
 
         cast.connection.connect(app.transport_id.as_str())?;
 
-        if !has_subtitle {
+        if has_subtitle {
+            let lang = subtitle_language(subtitle_url);
+            raw_cast_load(
+                &device.ip,
+                device.port,
+                app.transport_id.as_str(),
+                app.session_id.as_str(),
+                &proxy_url,
+                content_type,
+                &subtitle_proxy_url,
+                lang,
+            )?;
+        } else {
             cast.media.load(
                 app.transport_id.as_str(),
                 app.session_id.as_str(),
@@ -617,31 +651,12 @@ fn cast_stream(device: &Device, url: &str, proxy_base: &str, subtitle_url: &str)
                 },
             )?;
         }
-        // If has_subtitle: let cast drop here, then send raw LOAD below
 
         Ok((app.session_id, app.transport_id))
     })();
 
     match result {
-        Ok((session_id, transport_id)) => {
-            if has_subtitle {
-                let lang = subtitle_language(subtitle_url);
-                if let Err(e) = raw_cast_load(
-                    &device.ip,
-                    device.port,
-                    &transport_id,
-                    &session_id,
-                    &proxy_url,
-                    content_type,
-                    &subtitle_proxy_url,
-                    lang,
-                ) {
-                    eprintln!("[topos] raw LOAD error: {e}");
-                    send(&OutgoingMessage::CastError { error: e.to_string() });
-                    return None;
-                }
-            }
-
+        Ok((session_id, _transport_id)) => {
             send(&OutgoingMessage::CastStarted {
                 device: device.name.clone(),
                 proxy_url: proxy_url.clone(),

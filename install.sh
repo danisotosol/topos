@@ -41,14 +41,31 @@ if [ -d "$HOME/.config/chromium" ]; then
 fi
 
 echo ""
-echo "==> Firewall (UFW)..."
+echo "==> Firewall..."
 if command -v ufw &>/dev/null && sudo ufw status | grep -q "Status: active"; then
   sudo ufw allow from 192.168.1.0/24 to any port 7070 comment "topos proxy"
   echo "    UFW rule added: LAN -> port 7070"
   echo "    NOTE: if your LAN subnet is not 192.168.1.0/24, run:"
   echo "      sudo ufw allow from <your-subnet>/24 to any port 7070"
+elif command -v iptables &>/dev/null; then
+  INPUT_POLICY=$(sudo iptables -L INPUT --line-numbers -n | head -1 | grep -o "policy [A-Z]*" | awk '{print $2}')
+  if [ "$INPUT_POLICY" = "DROP" ] || ! sudo iptables -C INPUT -p tcp --dport 7070 -j ACCEPT 2>/dev/null; then
+    sudo iptables -I INPUT -p tcp --dport 7070 -j ACCEPT
+    echo "    iptables rule added: port 7070 ACCEPT"
+    # Persist across reboots
+    if [ -d /etc/iptables ]; then
+      sudo sh -c "iptables-save > /etc/iptables/iptables.rules"
+      sudo systemctl enable --now iptables 2>/dev/null || true
+      echo "    Saved to /etc/iptables/iptables.rules (persistent)"
+    else
+      echo "    WARNING: /etc/iptables not found — rule will be lost on reboot."
+      echo "    To persist: sudo iptables-save > /etc/iptables/iptables.rules"
+    fi
+  else
+    echo "    iptables rule already present."
+  fi
 else
-  echo "    UFW not active — no rule needed."
+  echo "    No UFW or iptables found — open port 7070 manually if casting fails."
 fi
 
 echo ""
