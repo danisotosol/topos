@@ -1,7 +1,6 @@
 # Rust
 target/
 native-host/target/
-Cargo.lock
 
 # General
 *.log
@@ -10,3 +9,6 @@ Cargo.lock
 
 # Native host binary
 /usr/local/bin/topos-host
+
+# Packaged extension build artifact
+*.xpi
