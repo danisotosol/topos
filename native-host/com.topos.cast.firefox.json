@@ -1,7 +1,7 @@
 {
   "name": "com.topos.cast",
   "description": "Topos Native Host",
-  "path": "/home/danie/.local/bin/topos-host",
+  "path": "/usr/local/bin/topos-host",
   "type": "stdio",
   "allowed_extensions": ["topos@cast"]
 }

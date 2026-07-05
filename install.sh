@@ -16,11 +16,20 @@ sudo chmod +x "$BINARY_DEST"
 
 echo "==> Installing native host manifests..."
 
-# Firefox
+# Firefox — generate the manifest from $BINARY_DEST so the path can never drift
+# from the actual binary location (copying a hardcoded JSON caused BUG-006).
 FIREFOX_DIR="$HOME/.mozilla/native-messaging-hosts"
 mkdir -p "$FIREFOX_DIR"
-cp "$NATIVE_DIR/com.topos.cast.firefox.json" "$FIREFOX_DIR/com.topos.cast.json"
-echo "    Firefox: $FIREFOX_DIR/com.topos.cast.json"
+cat > "$FIREFOX_DIR/com.topos.cast.json" << EOF
+{
+  "name": "com.topos.cast",
+  "description": "Topos Native Host",
+  "path": "$BINARY_DEST",
+  "type": "stdio",
+  "allowed_extensions": ["topos@cast"]
+}
+EOF
+echo "    Firefox: $FIREFOX_DIR/com.topos.cast.json -> $BINARY_DEST"
 
 # Chrome
 CHROME_DIR="$HOME/.config/google-chrome/NativeMessagingHosts"
