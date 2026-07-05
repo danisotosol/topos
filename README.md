@@ -4,7 +4,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/version-0.1.0--alpha-pink?style=flat-square"/>
-  <img src="https://img.shields.io/badge/platform-Linux-lightgrey?style=flat-square"/>
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey?style=flat-square"/>
   <img src="https://img.shields.io/badge/Firefox-109%2B-orange?style=flat-square"/>
   <img src="https://img.shields.io/badge/Chrome%2FChromium-supported-green?style=flat-square"/>
   <img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"/>
@@ -12,7 +12,7 @@
 
 ---
 
-**Topos** is a Linux browser extension that streams video from any web page to your Chromecast or Google TV — no accounts, no servers, no telemetry.
+**Topos** is a Linux and Windows browser extension that streams video from any web page to your Chromecast or Google TV — no accounts, no servers, no telemetry.
 
 Detects HLS (`.m3u8`) and DASH (`.mpd`) streams by intercepting network requests and `fetch`/`XHR` calls. Sends them directly to your device over the local network using the Google Cast protocol.
 
@@ -50,7 +50,7 @@ The browser extension is minimal JavaScript glue. All real logic — proxy, Cast
 
 ## Requirements
 
-- Linux
+- Linux or Windows 10/11
 - Firefox 109+ or Chrome/Chromium
 - Rust toolchain (`rustup`)
 - A Chromecast, Google TV, or Android TV on the same local network
@@ -58,6 +58,8 @@ The browser extension is minimal JavaScript glue. All real logic — proxy, Cast
 ---
 
 ## Install
+
+### Linux
 
 ```bash
 git clone https://github.com/danisotosol/topos
@@ -90,6 +92,36 @@ Then load the extension:
 
 **Chrome/Chromium:** `chrome://extensions` → Developer mode → Load unpacked → select `extension/`
 
+### Windows
+
+```powershell
+git clone https://github.com/danisotosol/topos
+cd topos
+powershell -ExecutionPolicy Bypass -File native-host\install.ps1
+```
+
+`install.ps1` compiles the binary, installs it to `%LOCALAPPDATA%\Topos\topos-host.exe`, registers the native messaging host for Firefox and Chrome, and adds a Windows Firewall rule for port 7070 — the only step that needs Administrator rights.
+
+Unlike Linux, Windows browsers locate the native host manifest through the registry. The script creates these keys under the current user, each pointing to the generated manifest file:
+
+```
+HKEY_CURRENT_USER\Software\Mozilla\NativeMessagingHosts\com.topos.cast
+HKEY_CURRENT_USER\Software\Google\Chrome\NativeMessagingHosts\com.topos.cast
+```
+
+Loading the extension works exactly as on Linux: `about:debugging` in Firefox, `chrome://extensions` in Chrome.
+
+---
+
+## Releases
+
+Each tagged release ships two platform artifacts:
+
+- `topos-linux-<tag>.tar.gz` — extension + native host + `install.sh`
+- `topos-windows-<tag>.zip` — extension + native host + `install.ps1`
+
+Both are built automatically by GitHub Actions (`.github/workflows/release.yml`) whenever a tag is pushed. Download the archive for your platform, extract it, and run the installer inside.
+
 ---
 
 ## Usage
@@ -104,13 +136,21 @@ Then load the extension:
 
 ## Firewall note
 
-The Chromecast fetches the stream from your machine on port `7070`. If you run UFW or another firewall, you must allow it:
+The Chromecast fetches the stream from your machine on port `7070`. `install.sh`/`install.ps1` try to open it automatically; if that's skipped, allow it manually.
+
+**Linux** (UFW or another firewall):
 
 ```bash
 sudo ufw allow from 192.168.1.0/24 to any port 7070
 ```
 
 Replace `192.168.1.0/24` with your actual LAN subnet if different.
+
+**Windows** (elevated PowerShell):
+
+```powershell
+New-NetFirewallRule -DisplayName "Topos proxy" -Direction Inbound -Protocol TCP -LocalPort 7070 -Action Allow -Profile Private,Domain -RemoteAddress LocalSubnet
+```
 
 ---
 
