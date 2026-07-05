@@ -11,8 +11,24 @@ const api = globalThis.browser ?? globalThis.chrome;
 })();
 
 window.addEventListener("message", (event) => {
-  if (event.data.source !== "TOPOS_INJECTED") return;
-  api.runtime.sendMessage(event.data);
+  // Only trust messages from this same window with a well-formed payload — any page,
+  // iframe, or ad can postMessage, so validate before relaying to the background.
+  if (event.source !== window) return;
+  const data = event.data;
+  if (!data || typeof data !== "object") return;
+  if (data.source !== "TOPOS_INJECTED" || data.type !== "STREAM_DETECTED") return;
+  try {
+    const u = new URL(data.url);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return;
+  } catch {
+    return;
+  }
+  api.runtime.sendMessage({
+    source: "TOPOS_INJECTED",
+    type: "STREAM_DETECTED",
+    url: data.url,
+    method: data.method,
+  });
 });
 
 // YouTube and similar sites add <video> dynamically after the page loads

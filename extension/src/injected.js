@@ -3,6 +3,7 @@
   window.__toposInjected = true;
 
   function notifyIfStream(url, method) {
+    if (typeof url !== "string" || !url) return;
     if (
       url.includes(".m3u8") ||
       url.includes(".mpd")
@@ -18,15 +19,25 @@
   if (window.fetch) {
     const originalFetch = window.fetch;
     window.fetch = function (input, options) {
-      const url = typeof input === "string" ? input : input.url;
-      notifyIfStream(url, "fetch");
+      // Interception must never throw into the page's own fetch — wrap defensively.
+      // input can be a string, a URL object, or a Request; String(URL) yields its href.
+      try {
+        const url = input instanceof Request ? input.url : String(input);
+        notifyIfStream(url, "fetch");
+      } catch (_) {
+        /* ignore — never break the host page's fetch */
+      }
       return originalFetch.apply(this, arguments);
     };
   }
 
   const originalXHROpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-    notifyIfStream(String(url), "xhr");
+    try {
+      notifyIfStream(String(url), "xhr");
+    } catch (_) {
+      /* ignore — never break the host page's XHR */
+    }
     return originalXHROpen.apply(this, [method, url, ...rest]);
   };
 

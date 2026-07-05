@@ -15,9 +15,20 @@ api.storage.session.get(null).then((saved) => {
   for (const [key, value] of Object.entries(saved)) {
     if (key.startsWith("streams_")) {
       streams[parseInt(key.replace("streams_", ""))] = value;
+    } else if (key.startsWith("subtitles_")) {
+      subtitles[parseInt(key.replace("subtitles_", ""))] = value;
+    } else if (key === "castingDeviceId") {
+      castingDeviceId = value;
     }
   }
 });
+
+// Persists the id of the device currently being cast to, so it survives MV3
+// service-worker termination (the worker dies after ~30s idle and loses memory).
+function setCastingDevice(id) {
+  castingDeviceId = id;
+  api.storage.session.set({ castingDeviceId: id }).catch(() => {});
+}
 
 // Connects to the native host for communication with the extension
 function connectNativeHost() {
@@ -26,11 +37,16 @@ function connectNativeHost() {
   nativePort.onMessage.addListener((message) => {
     if (message.type === "DEVICES_FOUND") {
       devices.splice(0, devices.length, ...message.devices);
+      // Push the fresh list to the popup so it renders without a manual refresh
+      api.runtime.sendMessage({ type: "DEVICES_UPDATED", devices }).catch(() => {});
     } else if (message.type === "CAST_STARTED") {
       console.log("[Topos] Cast started on:", message.device);
       console.log("[Topos] Proxy URL (open in Firefox to test):", message.proxy_url);
+      api.runtime.sendMessage(message).catch(() => {});
     } else if (message.type === "CAST_ERROR") {
       console.error("[Topos] Cast error:", message.error);
+      setCastingDevice(null);
+      api.runtime.sendMessage(message).catch(() => {});
     } else if (message.type === "CAST_STATE") {
       // Relay playback state updates to the popup (if open)
       api.runtime.sendMessage(message).catch(() => {});
@@ -38,7 +54,16 @@ function connectNativeHost() {
   });
 
   nativePort.onDisconnect.addListener(() => {
+    // Reading lastError is mandatory: a failed connectNative (missing/unregistered
+    // native host) reports ONLY here and is otherwise swallowed silently.
+    const err = api.runtime.lastError;
+    const reason = err?.message ?? "disconnected";
+    console.error("[Topos] Native host disconnected:", reason);
+    setCastingDevice(null);
     nativePort = null;
+    api.runtime
+      .sendMessage({ type: "CAST_ERROR", error: `Native host unavailable: ${reason}` })
+      .catch(() => {});
   });
 }
 
@@ -58,6 +83,7 @@ api.webRequest.onBeforeRequest.addListener(
     if (isSubtitle) {
       if (!subtitles[tabId]) {
         subtitles[tabId] = url;
+        api.storage.session.set({ [`subtitles_${tabId}`]: url }).catch(() => {});
         console.log("[Topos] Subtitle detected:", url);
       }
       return;
@@ -89,6 +115,7 @@ api.tabs.onUpdated.addListener((tabId, changeInfo) => {
     delete streams[tabId];
     delete subtitles[tabId];
     api.storage.session.remove(`streams_${tabId}`);
+    api.storage.session.remove(`subtitles_${tabId}`);
   }
 });
 
@@ -111,7 +138,7 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === "CAST_STREAM") {
     if (!nativePort) connectNativeHost();
-    castingDeviceId = message.device_id;
+    setCastingDevice(message.device_id);
     // Extract cookies for the stream domain so the proxy can impersonate the browser session
     (async () => {
       let cookieHeader = "";
@@ -144,7 +171,7 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "STOP_CAST") {
-    castingDeviceId = null;
+    setCastingDevice(null);
     if (nativePort) nativePort.postMessage({ type: "STOP_CAST" });
   }
 

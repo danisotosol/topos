@@ -9,6 +9,38 @@ let knownAt = 0;         // Date.now() when knownTime was set
 let totalDuration = 0;   // total media duration (seconds), 0 = unknown
 let seekInterval = null;
 let isSeeking = false;   // true while user is dragging the slider
+let castTimeout = null;  // reverts the optimistic casting UI if the host never confirms
+
+// Updates the footer status line + dot color. kind: "ok" | "warn" | "error".
+function setStatus(text, kind) {
+  const dot = document.getElementById("status-dot");
+  const txt = document.getElementById("status-text");
+  if (txt) txt.textContent = text;
+  if (dot) dot.className = "status-dot" + (kind === "error" ? " error" : kind === "warn" ? " warn" : "");
+}
+
+function clearCastTimeout() {
+  if (castTimeout) clearTimeout(castTimeout);
+  castTimeout = null;
+}
+
+// Drops the casting highlight/badge from every device and hides the controls.
+function revertCastingUI() {
+  document.querySelectorAll(".device").forEach((d) => {
+    d.classList.remove("casting");
+    const badge = d.querySelector(".live-badge");
+    if (badge) badge.remove();
+  });
+  hideControls();
+}
+
+// Escapes untrusted strings (filenames, mDNS device names) before they go into
+// innerHTML — prevents HTML/UI injection from network-controlled values.
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c],
+  );
+}
 
 function formatTime(secs) {
   const s = Math.max(0, Math.floor(secs));
@@ -179,8 +211,8 @@ function renderStreams(urls) {
     row.className = "stream";
     row.innerHTML = `
       <div class="stream-info">
-        <div class="stream-title">${filename}</div>
-        <div class="stream-origin">${origin}</div>
+        <div class="stream-title">${escapeHtml(filename)}</div>
+        <div class="stream-origin">${escapeHtml(origin)}</div>
       </div>
       <div class="stream-meta">
         <span class="chip chip-${type}">${label}</span>
@@ -214,8 +246,8 @@ function renderDevices(devices) {
           </svg>
         </div>
         <div>
-          <div class="device-name">${device.name}</div>
-          <div class="device-kind">${device.ip}</div>
+          <div class="device-name">${escapeHtml(device.name)}</div>
+          <div class="device-kind">${escapeHtml(device.ip)}</div>
         </div>
       </div>`;
 
@@ -237,6 +269,13 @@ function renderDevices(devices) {
         badge.textContent = "live";
         btn.appendChild(badge);
         showControls(device.name);
+        setStatus(`Connecting to ${device.name}…`, "warn");
+        // Revert the optimistic UI if the host never confirms (CAST_STARTED/CAST_STATE)
+        clearCastTimeout();
+        castTimeout = setTimeout(() => {
+          revertCastingUI();
+          setStatus("Cast timed out — no response from host", "error");
+        }, 12000);
 
         const url = currentStreams[0];
         api.runtime.sendMessage({
@@ -250,7 +289,9 @@ function renderDevices(devices) {
           tab_id: currentTabId,
         });
       } else {
+        clearCastTimeout();
         hideControls();
+        setStatus("native host connected", "ok");
         api.runtime.sendMessage({ type: "STOP_CAST" });
       }
     });
@@ -266,7 +307,22 @@ api.runtime.onMessage.addListener((message) => {
     renderStreams(message.streams);
   }
   if (message.type === "CAST_STATE") {
+    clearCastTimeout();
     updateCastState(message.player_state, message.current_time, message.duration);
+  }
+  if (message.type === "DEVICES_UPDATED") {
+    renderDevices(message.devices);
+  }
+  if (message.type === "CAST_STARTED") {
+    // Real confirmation from the host — cancel the timeout and mark casting live
+    clearCastTimeout();
+    setStatus("Casting", "ok");
+  }
+  if (message.type === "CAST_ERROR") {
+    // Cast/host failure — drop the optimistic UI and show the reason to the user
+    clearCastTimeout();
+    revertCastingUI();
+    setStatus(message.error || "Cast failed", "error");
   }
 });
 
