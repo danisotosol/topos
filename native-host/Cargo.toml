@@ -21,3 +21,11 @@ rust_cast   = "0.14"
 byteorder   = "1.5"
 log         = "0.4"
 env_logger  = "0.11"
+
+# On Windows there is no system OpenSSL for openssl-sys to find (it would need
+# vcpkg or a manual install), so build OpenSSL from source there. Scoped to
+# cfg(windows) so the Linux build keeps linking the system OpenSSL as before.
+# Cargo merges this with the plain `openssl` dependency above and unions the
+# features only when compiling for a Windows target (feature resolver v2).
+[target.'cfg(windows)'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }

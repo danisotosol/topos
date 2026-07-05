@@ -313,10 +313,35 @@ async fn proxy_handler(
 async fn start_proxy() -> (String, Arc<RwLock<String>>, Arc<RwLock<String>>) {
     use axum::{routing::get, Router};
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:7070")
-        .await
-        .expect("proxy: bind failed — is port 7070 already in use?");
-    let port = listener.local_addr().expect("proxy: no local addr").port();
+    // Prefer the fixed port 7070 (install.sh opens it in the firewall). If it is already
+    // taken (e.g. a leftover topos-host), fall back to an ephemeral port instead of
+    // panicking before the stdin loop ever starts — the host then still answers
+    // SCAN_DEVICES and can reply to CAST_STREAM with a clear error. NOTE: a fallback port
+    // is NOT covered by the firewall rule, so casting may fail until 7070 is freed.
+    let listener = match tokio::net::TcpListener::bind("0.0.0.0:7070").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[topos] port 7070 unavailable ({e}); trying an ephemeral port — casting may be firewall-blocked until 7070 is free");
+            match tokio::net::TcpListener::bind("0.0.0.0:0").await {
+                Ok(l) => l,
+                Err(e2) => {
+                    eprintln!("[topos] could not bind any proxy port: {e2}");
+                    // Keep the host alive with an unusable base so CAST_STREAM replies with
+                    // a clear error instead of the process dying silently.
+                    let cookies: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
+                    let referer: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
+                    return (String::new(), cookies, referer);
+                }
+            }
+        }
+    };
+    let port = match listener.local_addr() {
+        Ok(a) => a.port(),
+        Err(e) => {
+            eprintln!("[topos] proxy local_addr error: {e}");
+            7070
+        }
+    };
     let local_ip = get_local_ip();
     let proxy_base = format!("http://{}:{}", local_ip, port);
 
@@ -344,9 +369,10 @@ async fn start_proxy() -> (String, Arc<RwLock<String>>, Arc<RwLock<String>>) {
         .with_state(state);
 
     tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("proxy: serve error");
+        // Don't panic a detached task on serve failure — log so the issue is visible.
+        if let Err(e) = axum::serve(listener, app).await {
+            eprintln!("[topos] proxy serve loop exited: {e}");
+        }
     });
 
     (proxy_base, cookies, referer)
@@ -588,6 +614,16 @@ fn cast_stream(device: &Device, url: &str, proxy_base: &str, subtitle_url: &str)
     use rust_cast::channels::receiver::CastDeviceApp;
     use rust_cast::CastDevice;
 
+    // The Chromecast fetches the stream from this machine over the LAN. If the proxy never
+    // bound, or only resolved to a loopback address (no LAN route / VPN active), it is
+    // unreachable — fail with a clear message instead of a black screen + false CAST_STARTED.
+    if proxy_base.is_empty() || proxy_base.contains("127.0.0.1") || proxy_base.contains("localhost") {
+        send(&OutgoingMessage::CastError {
+            error: "No LAN address the Chromecast can reach (proxy unavailable or loopback). Free port 7070 / disconnect VPN, then cast again.".to_string(),
+        });
+        return None;
+    }
+
     let content_type = if url.contains(".m3u8") {
         "application/x-mpegURL"
     } else if url.contains(".mpd") {
@@ -747,6 +783,9 @@ where
 
     if let Err(e) = result {
         eprintln!("[topos] media control error: {e}");
+        // Surface control failures (dead session, device IP change) to the popup instead
+        // of only logging to stderr where the user never sees them.
+        send(&OutgoingMessage::CastError { error: e.to_string() });
     }
 }
 
@@ -778,17 +817,17 @@ fn main_loop(proxy_base: String, cookies_store: Arc<RwLock<String>>, referer_sto
                     referer,
                     subtitle_url,
                 }) => {
-                    if !cookies.is_empty() {
-                        eprintln!("[topos] got {} cookie bytes from browser", cookies.len());
-                        if let Ok(mut guard) = cookies_store.write() {
-                            *guard = cookies;
-                        }
-                    }
+                    // Always replace stored cookies/referer per cast — otherwise a later
+                    // cast to a different site inherits the previous site's credentials.
+                    eprintln!("[topos] got {} cookie bytes from browser", cookies.len());
                     if !referer.is_empty() {
                         eprintln!("[topos] referer: {}", &referer[..referer.len().min(80)]);
-                        if let Ok(mut guard) = referer_store.write() {
-                            *guard = referer;
-                        }
+                    }
+                    if let Ok(mut guard) = cookies_store.write() {
+                        *guard = cookies;
+                    }
+                    if let Ok(mut guard) = referer_store.write() {
+                        *guard = referer;
                     }
                     if !subtitle_url.is_empty() {
                         eprintln!("[topos] subtitle URL from browser: {}", &subtitle_url[..subtitle_url.len().min(100)]);
@@ -807,6 +846,13 @@ fn main_loop(proxy_base: String, cookies_store: Arc<RwLock<String>>, referer_sto
                     if let Some(ref session) = active_session {
                         stop_cast(session);
                         active_session = None;
+                    }
+                    // Clear stored credentials so they aren't reused for the next site.
+                    if let Ok(mut guard) = cookies_store.write() {
+                        guard.clear();
+                    }
+                    if let Ok(mut guard) = referer_store.write() {
+                        guard.clear();
                     }
                 }
                 Ok(IncomingMessage::PauseCast) => {
