@@ -138,6 +138,16 @@ $RuleName = 'Topos proxy'
 $FirewallCmd = "New-NetFirewallRule -DisplayName '$RuleName' -Direction Inbound" +
     " -Protocol TCP -LocalPort 7070 -Action Allow -Profile Private,Domain" +
     " -RemoteAddress LocalSubnet -Program '$BinaryDest'"
+# Detect (don't just document) whether the active network is even covered by
+# the rule's Private,Domain profiles. Public is Windows' default classification
+# for a freshly joined network, so this is the common case, not an edge case -
+# check now and name the actual interface so the fix below is copy-pasteable.
+$PublicProfiles = Get-NetConnectionProfile | Where-Object { $_.NetworkCategory -eq 'Public' }
+foreach ($p in $PublicProfiles) {
+    Write-Host "    WARNING: network '$($p.Name)' is classified Public - the firewall rule below will NOT match it, and casting will fail silently."
+    Write-Host "    Fix (elevated PowerShell): Set-NetConnectionProfile -InterfaceAlias '$($p.InterfaceAlias)' -NetworkCategory Private"
+}
+
 $ExistingRule = Get-NetFirewallRule -DisplayName $RuleName -ErrorAction SilentlyContinue
 if ($ExistingRule) {
     Write-Host '    Firewall rule already present.'
@@ -161,9 +171,6 @@ if ($ExistingRule) {
         Write-Host '    Run this in an elevated (Administrator) PowerShell:'
         Write-Host "      $FirewallCmd"
     }
-    Write-Host '    NOTE: on Public-classified networks the rule above still will'
-    Write-Host '    not match. Check with Get-NetConnectionProfile; if it shows'
-    Write-Host '    Public, either switch it to Private or add -Profile Public.'
 }
 
 Write-Host ''
