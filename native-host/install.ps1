@@ -32,6 +32,83 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     Write-Host 'ERROR: cargo not found on PATH. Install Rust from https://rustup.rs and re-run.'
     exit 1
 }
+
+# Windows has no system OpenSSL, so openssl-sys builds it from source, which
+# shells out to Perl. A bare `Get-Command perl` is not enough: Git for Windows
+# ships a minimal Perl that IS found on PATH but fails mid-build with
+# "Can't locate Locale/Maketext/Simple.pm" once openssl-src actually invokes
+# it, wasting several minutes of compile time before the user sees why.
+# Checking the module directly catches that case before the build starts.
+function Test-PerlUsable {
+    if (-not (Get-Command perl -ErrorAction SilentlyContinue)) {
+        return $false
+    }
+    # $ErrorActionPreference = 'Stop' escalates a native command's stderr
+    # output into a terminating error at the point it is written, before
+    # "2>$null" gets a chance to redirect it away. Drop to 'Continue' for
+    # just this call so a broken perl reports cleanly instead of crashing
+    # the installer with a raw exception dump.
+    $PrevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        perl -MLocale::Maketext::Simple -e "1" 2>$null
+        return ($LASTEXITCODE -eq 0)
+    } finally {
+        $ErrorActionPreference = $PrevEap
+    }
+}
+
+$PerlCmd = Get-Command perl -ErrorAction SilentlyContinue
+$PerlOk = Test-PerlUsable
+if (-not $PerlOk) {
+    if ($PerlCmd) {
+        Write-Host "WARNING: perl was found at $($PerlCmd.Source) but is missing modules OpenSSL's build needs (e.g. Locale::Maketext::Simple)."
+        Write-Host '         This is almost always the minimal Perl bundled with Git for Windows, which cannot build OpenSSL.'
+    } else {
+        Write-Host 'WARNING: perl not found on PATH. Building OpenSSL from source on Windows requires it.'
+    }
+    Write-Host '         Strawberry Perl (a full Windows Perl distribution) is the standard fix: https://strawberryperl.com/'
+
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Write-Host 'ERROR: winget not found, cannot install it for you. Install Strawberry Perl manually and re-run this script.'
+        exit 1
+    }
+
+    $Reply = Read-Host 'Install Strawberry Perl now via winget? [y/N]'
+    if ($Reply -notmatch '^[Yy]') {
+        Write-Host 'Skipping. Install manually and re-run:'
+        Write-Host '  winget install --id StrawberryPerl.StrawberryPerl -e'
+        exit 1
+    }
+
+    Write-Host '==> Installing Strawberry Perl via winget (this can take a minute)...'
+    winget install --id StrawberryPerl.StrawberryPerl -e --accept-package-agreements --accept-source-agreements
+    # Do not gate on $LASTEXITCODE here: winget returns non-zero for cases
+    # that are not real failures for us, e.g. "already installed, no newer
+    # version available" (seen when Perl is installed but was missing from
+    # this session's PATH). The functional check below (Get-Command + module
+    # import) is the real source of truth, not winget's own exit code.
+
+    # winget updates the registry PATH, but this already-running process keeps
+    # the PATH it started with, so re-running Get-Command here would still miss
+    # the new install. Extend the in-session PATH with Strawberry's default
+    # location instead of forcing the user to close and reopen PowerShell.
+    $StrawberryBin = 'C:\Strawberry\perl\bin'
+    if ((Test-Path $StrawberryBin) -and ($env:PATH -notlike "*$StrawberryBin*")) {
+        $env:PATH = "$StrawberryBin;C:\Strawberry\perl\site\bin;C:\Strawberry\c\bin;$env:PATH"
+    }
+
+    $PerlOk = Test-PerlUsable
+    if (-not $PerlOk) {
+        Write-Host 'ERROR: Strawberry Perl is still not usable in this PowerShell session.'
+        Write-Host '       If the winget output above shows a real error (not "already installed"), fix that first.'
+        Write-Host '       Otherwise it is likely installed at a non-default location: close this window, open a'
+        Write-Host '       new PowerShell, and re-run this script so PATH picks it up.'
+        exit 1
+    }
+    Write-Host '    Strawberry Perl installed and ready.'
+}
+
 Push-Location $NativeDir
 try {
     cargo build --release

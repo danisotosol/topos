@@ -53,6 +53,7 @@ The browser extension is minimal JavaScript glue. All real logic — proxy, Cast
 - Linux or Windows 10/11
 - Firefox 109+ or Chrome/Chromium
 - Rust toolchain (`rustup`)
+- **Windows only:** [Strawberry Perl](https://strawberryperl.com/) — Windows has no system OpenSSL, so the native host builds it from source, which needs Perl. The Perl bundled with Git for Windows is incomplete and will fail; install Strawberry Perl instead (`winget install StrawberryPerl.StrawberryPerl`).
 - A Chromecast, Google TV, or Android TV on the same local network
 
 ---
@@ -92,6 +93,8 @@ Then load the extension:
 
 **Chrome/Chromium:** `chrome://extensions` → Developer mode → Load unpacked → select `extension/`
 
+> **Firefox note:** "Load Temporary Add-on" only lasts for the current browser session — Firefox removes it every time you close the browser, and you'll need to load it again from `about:debugging`. This isn't a bug; unsigned extensions can't be installed permanently in release Firefox. For a persistent install, use Firefox Developer Edition/Nightly/ESR and set `xpinstall.signatures.required` to `false` in `about:config`, or self-sign the extension.
+
 ### Windows
 
 ```powershell
@@ -101,6 +104,14 @@ powershell -ExecutionPolicy Bypass -File native-host\install.ps1
 ```
 
 `install.ps1` compiles the binary, installs it to `%LOCALAPPDATA%\Topos\topos-host.exe`, registers the native messaging host for Firefox and Chrome, and adds a Windows Firewall rule for port 7070 — the only step that needs Administrator rights.
+
+Firefox-only? The command above is all you need — skip straight to loading the extension below. `-ChromeExtensionId <id>` is an optional flag, only needed if you also want Chrome/Chromium support:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File native-host\install.ps1 -ChromeExtensionId <id>
+```
+
+Without it, the Chrome manifest is still installed but left with a placeholder extension ID (harmless if you're not using Chrome).
 
 Unlike Linux, Windows browsers locate the native host manifest through the registry. The script creates these keys under the current user, each pointing to the generated manifest file:
 
@@ -151,6 +162,15 @@ Replace `192.168.1.0/24` with your actual LAN subnet if different.
 ```powershell
 New-NetFirewallRule -DisplayName "Topos proxy" -Direction Inbound -Protocol TCP -LocalPort 7070 -Action Allow -Profile Private,Domain -RemoteAddress LocalSubnet
 ```
+
+This rule only covers the streaming proxy. Device discovery uses mDNS (UDP 5353), which Windows handles through its own "Network Discovery" feature — off by default on networks classified **Public** (the default for any new network) and on for **Private**. If `install.ps1` warns that your network is Public, or devices never show up in the popup no matter how many times you click Rescan, check the classification and fix it before troubleshooting anything else:
+
+```powershell
+Get-NetConnectionProfile | Select-Object Name, InterfaceAlias, NetworkCategory
+Set-NetConnectionProfile -InterfaceAlias "<your interface>" -NetworkCategory Private
+```
+
+Both the firewall rule above and mDNS discovery need the network to be Private (or Domain) — a Public network silently breaks both, with no error shown anywhere.
 
 ---
 
